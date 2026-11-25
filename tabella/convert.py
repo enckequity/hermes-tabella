@@ -1,12 +1,12 @@
-"""documents.convert — Document format conversion via pandoc + LaTeX.
+"""documents.convert — Document format conversion via pandoc.
 
 Supports: markdown → PDF/DOCX/HTML/ODT/EPUB and any pandoc-supported format pair.
-Output directory is configurable via DOCS_OUTPUT_DIR (defaults to ~/Documents).
-Merged from the doc_convert plugin.
+PDF output is rendered by WeasyPrint from pandoc's HTML (no LaTeX).
+Output directory is configurable via DOCS_OUTPUT_DIR (defaults to ~/Documents);
+writes outside it are refused.
 """
 
 import re
-import json
 import logging
 import shutil
 import subprocess
@@ -14,17 +14,25 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from .utils import _get_output_dir, _is_in_output_dir, _resolve_output_dir
+from .utils import (
+    MissingDependencyError,
+    OutsideOutputDirError,
+    _resolve_output_dir,
+    check_read_allowed,
+    contained_output_path,
+    require,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _check_deps(needs_tex: bool = False) -> Optional[str]:
-    """Return error string if pandoc — or, for pdf targets, LaTeX — is missing."""
+def _check_deps() -> Optional[str]:
+    """Return an error string if pandoc is missing. Nothing is installed."""
     if not shutil.which("pandoc"):
-        return "pandoc is not installed. Install it (e.g. `sudo apt install pandoc`)."
-    if needs_tex and not shutil.which("pdflatex") and not shutil.which("xelatex"):
-        return "No LaTeX engine found. Install texlive (e.g. `sudo apt install texlive-xetex`)."
+        return (
+            "Document conversion is not available here: the pandoc tool is not "
+            "installed in this runtime."
+        )
     return None
 
 
@@ -66,11 +74,24 @@ def _validate_extra_args(extra_args: Optional[list]) -> list:
     return checked
 
 
-def _pdf_engine() -> str:
-    """Return preferred LaTeX engine."""
-    if shutil.which("xelatex"):
-        return "xelatex"
-    return "pdflatex"
+def _html_to_pdf(html_path: str, out_file: Path) -> None:
+    """Render pandoc's standalone HTML to PDF with WeasyPrint (no LaTeX).
+
+    Uses the same guarded URL fetcher as doc_create_document: no network, no
+    host files, only allowlisted data: URIs.
+    """
+    require("weasyprint", "weasyprint", "PDF output")
+    from weasyprint import HTML
+    from weasyprint.text.fonts import FontConfiguration
+
+    from .create import _safe_url_fetcher
+
+    font_config = FontConfiguration()
+    fetcher = _safe_url_fetcher(font_config)
+    html_str = Path(html_path).read_text(encoding="utf-8")
+    HTML(string=html_str, url_fetcher=fetcher).write_pdf(
+        str(out_file), font_config=font_config
+    )
 
 
 # ── tool ──
@@ -89,12 +110,14 @@ def doc_convert(
         to_format: Target format (e.g. "pdf", "docx", "html", "odt", "epub").
         from_format: Optional source format hint (e.g. "markdown", "html").
                      When omitted, pandoc infers from file extension.
-        output_path: Optional absolute path for the output file.
-                     When omitted, writes to the user's documents directory.
+        output_path: Optional output path inside the output folder (relative
+                     paths are taken relative to it). Anything resolving
+                     outside the output folder is refused.
+                     When omitted, writes to the output folder.
         extra_args:  Optional extra pandoc CLI flags (e.g. ["--toc", "-Vmargin=1in"]).
                      NOTE: -V must be a single token ("-Vkey=value") — the
                      two-token "-V key=value" form is rejected by the allowlist.
-        category:    Optional subfolder under ~/documents/ (e.g. "reports", "invoices").
+        category:    Optional subfolder of the output folder (e.g. "reports").
 
     Returns:
         {"success": bool, "output_path": str, "from_format": str, "to_format": str,
@@ -103,6 +126,10 @@ def doc_convert(
     src = Path(input_path).expanduser().resolve()
     if not src.exists():
         return {"success": False, "error": f"Source file not found: {src}"}
+    try:
+        check_read_allowed(src)
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
 
     # Determine formats
     src_fmt = from_format or _infer_format(src.suffix.lstrip(".").lower())
@@ -111,70 +138,75 @@ def doc_convert(
     _check_format(tgt_fmt, "to_format")
     extra = _validate_extra_args(extra_args)
 
-    # pandoc is always required; a TeX engine only for pdf output
-    dep_err = _check_deps(tgt_fmt == "pdf")
+    # Refuse a write target outside the output folder before any work, so a
+    # refused call creates nothing (no directory, no temp file, no pandoc run).
+    try:
+        if output_path:
+            out_file = contained_output_path(output_path)
+        else:
+            out_file = _resolve_output_dir(category) / f"{src.stem}.{tgt_fmt}"
+    except OutsideOutputDirError as e:
+        return {"success": False, "error": str(e)}
+
+    # pandoc is always required. PDF output is rendered by WeasyPrint from
+    # pandoc's HTML, so no TeX installation is needed or used.
+    dep_err = _check_deps()
     if dep_err:
         return {"success": False, "error": dep_err}
 
-    # pandoc converts to PDF, never from it: extract the text first, then
-    # convert the extracted markdown. Scanned pages come back OCR'd, so this
-    # works where a bare `pandoc -f pdf` cannot exist at all.
-    pandoc_src, pandoc_fmt, tmp_md = str(src), src_fmt, None
-    if src_fmt == "pdf":
-        try:
-            text = _extract_pdf(src)
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"could not extract text from PDF: {type(e).__name__}: {e}",
-            }
-        if not text.strip():
-            return {"success": False, "error": f"PDF has no extractable text: {src}"}
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".md", delete=False, encoding="utf-8"
-        ) as fh:
-            fh.write(text)
-            tmp_md = fh.name
-        pandoc_src, pandoc_fmt = tmp_md, "markdown"
+    with tempfile.TemporaryDirectory(prefix="tabella-convert-") as work:
+        # pandoc converts to PDF, never from it: extract the text first, then
+        # convert the extracted markdown. Scanned pages come back OCR'd when
+        # OCR is available, so this works where `pandoc -f pdf` cannot.
+        pandoc_src, pandoc_fmt = str(src), src_fmt
+        if src_fmt == "pdf":
+            try:
+                text = _extract_pdf(src)
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"could not extract text from PDF: {type(e).__name__}: {e}",
+                }
+            if not text.strip():
+                return {"success": False, "error": f"PDF has no extractable text: {src}"}
+            pandoc_src = str(Path(work) / "extracted.md")
+            Path(pandoc_src).write_text(text, encoding="utf-8")
+            pandoc_fmt = "markdown"
 
-    # Determine output path
-    if output_path:
-        out_file = Path(output_path).expanduser().resolve()
+        if tgt_fmt == "pdf":
+            pandoc_out, pandoc_to = str(Path(work) / "render.html"), "html5"
+        else:
+            pandoc_out, pandoc_to = str(out_file), tgt_fmt
+
+        # --sandbox: pandoc may read only the input file itself, so an
+        # \input{...} / `.. include::` / image reference inside the document
+        # cannot pull other host files into the output.
+        cmd = ["pandoc", pandoc_src, "-o", pandoc_out, "-f", pandoc_fmt, "-t", pandoc_to,
+               "--sandbox"]
+        if tgt_fmt == "pdf":
+            cmd.append("--standalone")
+        cmd.extend(extra)
+
         out_file.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        out_dir = _resolve_output_dir(category)
-        stem = src.stem
-        out_file = out_dir / f"{stem}.{tgt_fmt}"
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "error": f"pandoc failed (exit {result.returncode}): {result.stderr.strip()}",
+                }
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "pandoc timed out after 5 minutes."}
+        except Exception as e:
+            return {"success": False, "error": f"pandoc error: {e}"}
 
-    # Warn if output is outside the configured output directory
-    if not _is_in_output_dir(out_file):
-        logger.warning(
-            "doc_convert: output file %s is outside the configured output directory. "
-            "Files saved here may not be synced.",
-            out_file,
-        )
-
-    # Build pandoc command
-    cmd = ["pandoc", pandoc_src, "-o", str(out_file), "-f", pandoc_fmt, "-t", tgt_fmt]
-    if tgt_fmt == "pdf":
-        engine = _pdf_engine()
-        cmd.extend(["--pdf-engine", engine])
-    cmd.extend(extra)
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            return {
-                "success": False,
-                "error": f"pandoc failed (exit {result.returncode}): {result.stderr.strip()}",
-            }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "pandoc timed out after 5 minutes."}
-    except Exception as e:
-        return {"success": False, "error": f"pandoc error: {e}"}
-    finally:
-        if tmp_md:
-            Path(tmp_md).unlink(missing_ok=True)
+        if tgt_fmt == "pdf":
+            try:
+                _html_to_pdf(pandoc_out, out_file)
+            except MissingDependencyError as e:
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                return {"success": False, "error": f"PDF rendering failed: {type(e).__name__}: {e}"}
 
     if not out_file.exists():
         return {"success": False, "error": f"Output file was not created: {out_file}"}
@@ -185,7 +217,7 @@ def doc_convert(
         "from_format": src_fmt,
         "to_format": tgt_fmt,
         "extracted_text": src_fmt == "pdf",
-        "pdf_engine": _pdf_engine() if tgt_fmt == "pdf" else None,
+        "pdf_engine": "weasyprint" if tgt_fmt == "pdf" else None,
         "message": f"MEDIA:{out_file}\n\nConverted {src.name} → {tgt_fmt}: {out_file}",
     }
 
@@ -225,52 +257,3 @@ def _check_format(name: str, which: str) -> None:
             f"unsupported {which} {name!r}: must be a built-in pandoc format "
             "(alphanumeric/underscore, optional +ext/-ext modifiers)"
         )
-
-
-def _handle_doc_convert(args: dict, **kwargs) -> str:
-    """Handler wrapper for doc_convert tool."""
-    result = doc_convert(**args)
-    if isinstance(result, dict):
-        return json.dumps(result)
-    return result
-
-
-# ── Hermes plugin registration ──
-def register(registry):
-    registry.register_tool(
-        name="doc_convert",
-        toolset="doc-convert",
-        schema={
-            "type": "object",
-            "properties": {
-                "input_path": {
-                    "type": "string",
-                    "description": "Absolute path to the source document.",
-                },
-                "to_format": {
-                    "type": "string",
-                    "description": "Target format: pdf, docx, html, odt, epub, etc.",
-                },
-                "from_format": {
-                    "type": "string",
-                    "description": "Optional source format hint (e.g. markdown, html). Pandoc infers from extension if omitted.",
-                },
-                "output_path": {
-                    "type": "string",
-                    "description": "Optional absolute output path. Defaults to user's documents directory.",
-                },
-                "extra_args": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional extra pandoc CLI flags.",
-                },
-                "category": {
-                    "type": "string",
-                    "description": "Optional subfolder under documents/ (e.g. 'reports').",
-                },
-            },
-            "required": ["input_path", "to_format"],
-        },
-        handler=_handle_doc_convert,
-        description="Convert documents between formats (PDF, DOCX, HTML, ODT, EPUB, etc.) using pandoc + LaTeX.",
-    )

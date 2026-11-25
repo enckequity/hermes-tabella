@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """tabella MCP server — stdio Model Context Protocol server.
 
-Exposes three tools:
-  - doc_read:       Read/extract text from any document
-  - doc_convert:    Convert between formats via pandoc
-  - doc_create:     Create documents from structured JSON or raw HTML/CSS
+Exposes four tools:
+  - doc_read:            Read/extract text from any document
+  - doc_read_meta:       Read document metadata
+  - doc_convert:         Convert between formats via pandoc
+  - doc_create_document: Create documents from structured JSON or raw HTML/CSS
 
-On first startup, if the docs venv is missing, the server runs
-scripts/setup.sh to create a venv in PLUGIN_DATA (or ~/.venvs/docs)
-and install all dependencies automatically.
+Runs on the interpreter that starts it. Nothing is installed or downloaded:
+missing packages make the affected tool return a plain "not available" error.
 
 Run standalone for testing:
     python3 mcp_server.py
@@ -19,14 +19,9 @@ Or wire into an MCP client via stdio.
 from __future__ import annotations
 
 import json
-import os
 import sys
-from pathlib import Path
 from typing import Any
 
-# ── Bootstrap: ensure docs venv exists before serving ───────────────────────
-# shared with the HTTP server (scripts/mcp_http_server.py) — one implementation
-from tabella.bootstrap import ensure_venv
 from tabella import __version__
 from tabella.toolspec import (
     PROTOCOL_VERSION,
@@ -139,15 +134,6 @@ def _handle_request(msg: dict) -> dict | None:
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 def main():
-    # Bootstrap venv on first run, then re-exec into its python so all tool
-    # imports (weasyprint/python-docx/...) resolve from the venv, not the
-    # client's interpreter. Guard against exec loops via the env marker.
-    if not os.environ.get("TABELL_REEXEC"):
-        venv_python = ensure_venv()
-        if Path(venv_python).exists() and Path(sys.executable) != Path(venv_python):
-            os.environ["TABELL_REEXEC"] = "1"
-            os.execv(venv_python, [venv_python] + sys.argv)
-
     while True:
         try:
             msg = _read_message()

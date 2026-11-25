@@ -1,7 +1,10 @@
 """documents.read — read documents via anydoc (primary) + LiteParse (OCR fallback).
 
-Merged from the doc_read plugin. Dependencies (firecrawl-anydoc, liteparse) are
-now installed directly in the the bootstrapped per-plugin venv (PYTHON_BOOTSTRAP: scripts/setup.sh; stdio/HTTP servers exec into it on first serve)
+Dependencies (firecrawl-anydoc, liteparse) must already be importable in the
+host Python; nothing is installed or downloaded at runtime. OCR runs only when
+English Tesseract language data is already on disk (TESSDATA_PREFIX, or the
+Debian tesseract-ocr-eng location): LiteParse would otherwise fetch it from
+the network, so without local data OCR is switched off.
 
 Architecture:
   - Office formats (DOCX, DOC, XLSX, XLSB, PPTX, PPT, ODT, ODS, ODP, RTF,
@@ -11,9 +14,36 @@ Architecture:
     Used when anydoc returns empty for a PDF, or for image files directly.
   - Plain text (.txt, .md, .json, .py, .yaml, etc.) → direct file read.
 """
-import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from .utils import check_read_allowed, require
+
+# Where already-installed English OCR data may live. First hit wins.
+_TESSDATA_DIRS = (
+    "/usr/share/tesseract-ocr/5/tessdata",
+    "/usr/share/tesseract-ocr/4.00/tessdata",
+    "/usr/share/tessdata",
+)
+
+
+def _local_tessdata() -> Optional[str]:
+    """Directory holding eng.traineddata on this host, or None.
+
+    LiteParse downloads missing traineddata from GitHub on first OCR; passing a
+    directory that already has it (and disabling OCR when none exists) keeps
+    reading fully offline.
+    """
+    candidates = []
+    configured = os.environ.get("TESSDATA_PREFIX")
+    if configured:
+        candidates.append(configured)
+    candidates.extend(_TESSDATA_DIRS)
+    for d in candidates:
+        if (Path(d) / "eng.traineddata").is_file():
+            return d
+    return None
 
 # ── Format classification ────────────────────────────────────────────────────
 
@@ -36,7 +66,7 @@ def _run_anydoc(path: str, timeout: int = 60) -> str:
     Returns the Markdown text, or empty string if the document has no
     extractable text (e.g. scanned PDF without OCR).
     """
-    import anydoc
+    anydoc = require("anydoc", "firecrawl-anydoc", "Document reading")
     md = anydoc.to_markdown(path)
     return md or ""
 
@@ -48,9 +78,15 @@ def _run_liteparse(path: str, extract_images: bool = True, timeout: int = 120) -
 
     Used for scanned PDFs and images where anydoc returns empty.
     """
-    from liteparse import LiteParse, ParseResult
+    liteparse = require("liteparse", "liteparse", "Scanned-page and image reading")
+    LiteParse, ParseResult = liteparse.LiteParse, liteparse.ParseResult
 
-    parser = LiteParse(ocr_enabled=extract_images, output_format="text")
+    tessdata = _local_tessdata()
+    ocr = bool(extract_images and tessdata)
+    kwargs = {"ocr_enabled": ocr, "output_format": "text", "quiet": True}
+    if ocr:
+        kwargs["tessdata_path"] = tessdata
+    parser = LiteParse(**kwargs)
     result = parser.parse(path)
     text = ""
     if isinstance(result, ParseResult):
@@ -102,6 +138,7 @@ def read(path: str, max_chars: Optional[int] = None, extract_images: bool = True
       4. PDFs with no text layer — anydoc returns empty or raises NeedsOcrError →
          LiteParse (OCR fallback for scanned PDFs)
     """
+    check_read_allowed(path)
     suffix = Path(path).suffix.lower()
 
     # 1. Plain text fast path
@@ -110,6 +147,11 @@ def read(path: str, max_chars: Optional[int] = None, extract_images: bool = True
 
     # 2. Images → LiteParse OCR directly
     if suffix in IMAGE_SUFFIXES:
+        if not (extract_images and _local_tessdata()):
+            raise RuntimeError(
+                "Reading text from images is not available here: OCR language "
+                "data is not installed in this runtime."
+            )
         data = _run_liteparse(path, extract_images=extract_images)
         text = data.get("text") or ""
         if max_chars:
@@ -150,6 +192,7 @@ def read(path: str, max_chars: Optional[int] = None, extract_images: bool = True
 
 def read_meta(path: str) -> Dict[str, Any]:
     """Extract metadata from a document."""
+    check_read_allowed(path)
     suffix = Path(path).suffix.lower()
     if suffix in TEXT_SUFFIXES:
         return {"path": path, "format": "text"}
@@ -173,77 +216,3 @@ def read_meta(path: str) -> Dict[str, Any]:
             "size_bytes": st.st_size,
             "mtime": st.st_mtime,
         }
-
-
-# ── Hermes plugin registration ──
-
-def register(registry):
-    if registry is None:
-        return
-
-    def doc_read(path: str, max_chars: int = 1_000_000, extract_images: bool = True):
-        try:
-            text = read(path, max_chars=max_chars, extract_images=extract_images)
-            return {
-                "success": True,
-                "path": path,
-                "text": text,
-                "length": len(text),
-                "message": f"Read {len(text)} chars from {path}",
-            }
-        except Exception as e:
-            return {"success": False, "path": path, "error": f"{type(e).__name__}: {e}"}
-
-    def doc_read_meta(path: str):
-        try:
-            meta = read_meta(path)
-            return {"success": True, "path": path, "metadata": meta}
-        except Exception as e:
-            return {"success": False, "path": path, "error": f"{type(e).__name__}: {e}"}
-
-    registry.register_tool(
-        name="doc_read",
-        toolset="doc",
-        schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to the document.",
-                },
-                "max_chars": {
-                    "type": "integer",
-                    "description": "Maximum characters to return.",
-                    "default": 1_000_000,
-                },
-                "extract_images": {
-                    "type": "boolean",
-                    "description": "Extract text from images via OCR (LiteParse + Tesseract).",
-                    "default": True,
-                },
-            },
-            "required": ["path"],
-        },
-        handler=lambda args, **kw: json.dumps(doc_read(
-            args["path"],
-            max_chars=args.get("max_chars", 1_000_000),
-            extract_images=args.get("extract_images", True),
-        )),
-        description="Read and extract text from documents. Uses anydoc for office formats (DOCX, XLSX, PPTX, ODT, RTF, EPUB, PDF → Markdown) and LiteParse for OCR (scanned PDFs, images). Plain text files read directly.",
-    )
-    registry.register_tool(
-        name="doc_read_meta",
-        toolset="doc",
-        schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to the document.",
-                },
-            },
-            "required": ["path"],
-        },
-        handler=lambda args, **kw: json.dumps(doc_read_meta(args["path"])),
-        description="Read document metadata (PDF info, image EXIF, etc.) via LiteParse.",
-    )

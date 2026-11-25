@@ -48,6 +48,7 @@ def test_extra_args_rejects_code_exec_vectors(tmp_path, evil):
         doc_convert(_md(tmp_path), "html", extra_args=[evil])
 
 
+@pytest.mark.skipif(__import__("shutil").which("pandoc") is None, reason="pandoc not installed")
 def test_extra_args_accepts_the_allowlist(tmp_path):
     out = doc_convert(_md(tmp_path), "html", extra_args=["--toc", "-Vmargin=1in"])
     assert out.get("success") is True, out

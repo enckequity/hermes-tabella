@@ -2,15 +2,13 @@
 """tabella MCP server — streamable-HTTP transport (stdio removed).
 
 Tool surface: doc_read, doc_read_meta, doc_convert, doc_create_document,
-doc_edit_pdf. POST /mcp JSON-RPC, GET /status health, SSE responses when
+(no PDF editing). POST /mcp JSON-RPC, GET /status health, SSE responses when
 Accept: text/event-stream, Mcp-Session-Id reuse, protocol 2025-06-18.
 
 Keyless loopback by default (127.0.0.1:8602); TABELLA_TOKEN env makes it a
 Bearer wall (401 on missing/wrong token). Python stdlib only.
 
-On main() startup the docs venv bootstrap runs (scripts/setup.sh) when
-DOCS_VENV_PYTHON is unset or the venv is missing — idempotent, stderr-noted,
-never fatal.
+Runs on the interpreter that starts it; nothing is installed or downloaded.
 
 Run:  python3 scripts/mcp_http_server.py [--addr 127.0.0.1:8602]
 """
@@ -23,7 +21,6 @@ import os
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -68,7 +65,6 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 
 # ── Bootstrap: ensure docs venv exists before serving ───────────────────────
 # shared with the stdio server (mcp_server.py) — one implementation
-from tabella.bootstrap import ensure_venv
 from tabella import __version__
 from tabella.toolspec import (
     PROTOCOL_VERSION,
@@ -162,8 +158,7 @@ class Handler(BaseHTTPRequestHandler):
                        "capabilities": {"tools": {}},
                        "serverInfo": {"name": "tabella", "version": __version__},
                        "instructions": "Document lifecycle suite. Tools: doc_read, "
-                                       "doc_read_meta, doc_convert, doc_create_document, "
-                                       "doc_edit_pdf."}
+                                       "doc_read_meta, doc_convert, doc_create_document."}
             elif method == "notifications/initialized":
                 self._json({}, 202, sid)
                 return
@@ -197,15 +192,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    # Bootstrap venv, then re-exec into the venv python so tool imports
-    # resolve from it rather than the ambient interpreter. Env marker guards
-    # against exec-loop when the venv python is unusable.
-    if not os.environ.get("TABELL_REEXEC"):
-        venv_python = ensure_venv()
-        if Path(venv_python).exists() and Path(sys.executable) != Path(venv_python):
-            os.environ["TABELL_REEXEC"] = "1"
-            os.execv(venv_python, [venv_python] + sys.argv)
-
     ap = argparse.ArgumentParser(prog="tabella-mcp-http")
     ap.add_argument("--addr", default="127.0.0.1:8602")
     a = ap.parse_args()

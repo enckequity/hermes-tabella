@@ -5,6 +5,42 @@
 A portable document lifecycle suite: create, convert, and read documents
 from structured JSON or raw HTML/CSS.
 
+## This fork (enckequity/hermes-tabella)
+
+Hosted-plugin fork of upstream `e6e53da` (2.0.7) for TeamShift (#4656). It
+loads as a directory plugin (`plugin.yaml` + `__init__.py` `register(ctx)`)
+and registers four tools in one toolset, `tabella`: `doc_read`,
+`doc_read_meta`, `doc_convert`, `doc_create_document`. No hooks. Changes:
+
+- **Writes stay in the output folder.** Every write target (`output_path`,
+  `category`, the default file name) is resolved to its real path, with
+  symlinks followed, and refused unless it lies inside `DOCS_OUTPUT_DIR`
+  (default `~/Documents`). Relative paths are taken relative to that folder.
+  The model-supplied `_user_context.user_files` and `/tmp` redirect are gone.
+- **No runtime installs or downloads.** `tabella/bootstrap.py` and
+  `scripts/setup.sh` are removed; the MCP servers no longer build or re-exec
+  into a venv. Packages must already be importable in the host Python; a
+  missing one makes the affected tool return a plain "not available" error.
+- **No PyMuPDF (AGPL).** `doc_edit_pdf` is removed and `pymupdf` is dropped
+  from `pyproject.toml` and `requirements-pinned.txt`. PDF reading uses
+  anydoc (MIT) for text-layer PDFs and LiteParse (Apache-2.0) for scans.
+- **No LaTeX.** `doc_convert` to PDF renders pandoc's HTML with WeasyPrint
+  (the same guarded, network-free fetcher as `doc_create_document`), so
+  texlive is not needed. pandoc runs with `--sandbox`, so a document cannot
+  include other host files. `doc_convert` is offered only when `pandoc` is
+  on PATH.
+- **Offline OCR only.** LiteParse 2.x is native (no Node) but downloads
+  Tesseract language data from GitHub when it is missing. OCR is enabled only
+  when `eng.traineddata` is already on disk (`TESSDATA_PREFIX`, or Debian's
+  `tesseract-ocr-eng` at `/usr/share/tesseract-ocr/5/tessdata`); otherwise it
+  is switched off and image reading reports that OCR is not available.
+- **Host read guard.** Reads (`doc_read`, `doc_read_meta`, convert inputs,
+  templates, docx images) go through the host's credential-file read guard
+  when it is present.
+
+The installation, bootstrap, LaTeX and `doc_edit_pdf` sections below describe
+upstream and do not apply to this fork.
+
 ## Cross-Platform Compatibility
 
 This package conforms to the [Agent Plugins v1.0.0](https://agent-plugins.org/specification)
