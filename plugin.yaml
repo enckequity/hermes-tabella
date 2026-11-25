@@ -1,5 +1,5 @@
 name: tabella
-version: 2.0.7
+version: 2.0.8
 description: Create, convert and read documents locally — DOCX, XLSX, PPTX, PDF, ODT, ODS and ODP. Writes only inside the documents output folder; installs and downloads nothing at runtime.
 author: D Yiapanis
 license: MIT

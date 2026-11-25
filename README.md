@@ -7,7 +7,7 @@ from structured JSON or raw HTML/CSS.
 
 ## This fork (enckequity/hermes-tabella)
 
-Hosted-plugin fork of upstream `e6e53da` (2.0.7) for TeamShift (#4656). It
+Hosted-plugin fork of upstream `e6e53da` (2.0.7), merged with upstream `56de1f1` (2.0.8 dependency refresh), for TeamShift (#4656). It
 loads as a directory plugin (`plugin.yaml` + `__init__.py` `register(ctx)`)
 and registers four tools in one toolset, `tabella`: `doc_read`,
 `doc_read_meta`, `doc_convert`, `doc_create_document`. No hooks. Changes:
