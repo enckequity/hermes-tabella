@@ -231,6 +231,7 @@ class _FakeLiteParse:
 
 def _fake_liteparse(monkeypatch):
     _FakeLiteParse.calls = []
+    monkeypatch.setattr(_FakeLiteParse, "parse", lambda self, path: "fake text")
     mod = types.ModuleType("liteparse")
     mod.LiteParse = _FakeLiteParse
     mod.ParseResult = type("ParseResult", (), {})
@@ -247,6 +248,16 @@ def test_ocr_off_without_local_tessdata(tmp_path, monkeypatch):
     img.write_bytes(b"\x89PNG")
     with pytest.raises(RuntimeError, match="not available"):
         read_mod.read(str(img))
+
+
+def test_scanned_pdf_without_ocr_says_so(tmp_path, monkeypatch):
+    _fake_liteparse(monkeypatch)
+    monkeypatch.setattr(_FakeLiteParse, "parse", lambda self, path: "")
+    monkeypatch.setattr(read_mod, "_local_tessdata", lambda: None)
+    monkeypatch.setattr(read_mod, "_run_anydoc", lambda path: "")
+    with pytest.raises(RuntimeError, match="no text layer.*not available"):
+        read_mod.read(str(tmp_path / "scan.pdf"))
+    assert read_mod.read(str(tmp_path / "scan.pdf"), extract_images=False) == ""
 
 
 def test_ocr_uses_local_tessdata_when_present(tmp_path, monkeypatch):

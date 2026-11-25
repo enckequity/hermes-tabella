@@ -28,6 +28,9 @@ _TESSDATA_DIRS = (
 )
 
 
+_NO_OCR = "{what} is not available here: OCR language data is not installed in this runtime."
+
+
 def _local_tessdata() -> Optional[str]:
     """Directory holding eng.traineddata on this host, or None.
 
@@ -147,11 +150,8 @@ def read(path: str, max_chars: Optional[int] = None, extract_images: bool = True
 
     # 2. Images → LiteParse OCR directly
     if suffix in IMAGE_SUFFIXES:
-        if not (extract_images and _local_tessdata()):
-            raise RuntimeError(
-                "Reading text from images is not available here: OCR language "
-                "data is not installed in this runtime."
-            )
+        if extract_images and not _local_tessdata():
+            raise RuntimeError(_NO_OCR.format(what="Reading text from images"))
         data = _run_liteparse(path, extract_images=extract_images)
         text = data.get("text") or ""
         if max_chars:
@@ -184,6 +184,9 @@ def read(path: str, max_chars: Optional[int] = None, extract_images: bool = True
                     f"anydoc failed: {anydoc_error}; liteparse fallback also failed: {liteparse_err}"
                 )
             raise RuntimeError(f"both anydoc and liteparse returned no text. liteparse: {liteparse_err}")
+        if not text.strip() and extract_images and not _local_tessdata():
+            raise RuntimeError(_NO_OCR.format(
+                what="This document has no text layer, and reading scanned pages"))
 
     if max_chars:
         text = text[:max_chars]
