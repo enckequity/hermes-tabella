@@ -1,0 +1,14 @@
+name: tabella
+version: 2.0.8
+description: Create, convert and read documents locally — DOCX, XLSX, PPTX, PDF, ODT, ODS and ODP. Writes only inside the documents output folder; installs and downloads nothing at runtime.
+author: D Yiapanis
+license: MIT
+homepage: https://github.com/dyiapanis/tabella
+requires_hermes: ">=0.22"
+provides_tools:
+  - doc_read
+  - doc_read_meta
+  - doc_convert
+  - doc_create_document
+provides_hooks: []
+tags: [documents, docx, xlsx, pptx, pdf, odt, tools]

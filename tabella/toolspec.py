@@ -1,6 +1,7 @@
 """The MCP tool surface: one table, one dispatcher, both transports.
 
-The stdio server and the self-hosted HTTP server serve the same five tools and
+The plugin registration, the stdio server and the self-hosted HTTP server serve
+the same four tools and
 used to carry byte-identical copies of this file's contents — 220 lines twice,
 one string apart. Anything that changes a schema or a result shape changes it
 here, once, and both transports move together.
@@ -19,9 +20,9 @@ TOOLS = [
     {
         "name": "doc_read",
         "description": (
-            "Read and extract text from documents. Uses anydoc for office formats "
-            "(DOCX, XLSX, PPTX, ODT, RTF, EPUB, PDF → Markdown) and LiteParse for OCR "
-            "(scanned PDFs, images). Plain text files read directly."
+            "Read and extract text from documents: office formats and PDFs "
+            "(DOCX, XLSX, PPTX, ODT, RTF, EPUB, PDF → Markdown), plain text files, "
+            "and scanned pages or images via OCR when OCR is available."
         ),
         "inputSchema": {
             "type": "object",
@@ -37,7 +38,7 @@ TOOLS = [
                 },
                 "extract_images": {
                     "type": "boolean",
-                    "description": "Extract text from images via OCR (LiteParse + Tesseract).",
+                    "description": "Extract text from images and scanned pages via OCR (when available).",
                     "default": True,
                 },
             },
@@ -46,7 +47,7 @@ TOOLS = [
     },
     {
         "name": "doc_read_meta",
-        "description": "Read document metadata (PDF info, image EXIF, etc.) via LiteParse.",
+        "description": "Read document metadata (PDF info, image EXIF, etc.).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -61,8 +62,9 @@ TOOLS = [
     {
         "name": "doc_convert",
         "description": (
-            "Convert documents between formats (PDF, DOCX, HTML, ODT, EPUB, etc.) "
-            "using pandoc + LaTeX. Requires system pandoc and texlive-xetex for PDF output."
+            "Convert documents between formats (DOCX, HTML, ODT, EPUB, Markdown, PDF, etc.). "
+            "PDF input is read as text; PDF output is rendered from HTML. "
+            "The result is saved in the documents output folder."
         ),
         "inputSchema": {
             "type": "object",
@@ -81,7 +83,7 @@ TOOLS = [
                 },
                 "output_path": {
                     "type": "string",
-                    "description": "Optional absolute output path. Defaults to the documents directory (DOCS_OUTPUT_DIR or ~/Documents).",
+                    "description": "Optional output path inside the documents output folder (relative paths are taken relative to it). Paths outside that folder are refused. Defaults to the folder itself.",
                 },
                 "extra_args": {
                     "type": "array",
@@ -90,7 +92,7 @@ TOOLS = [
                 },
                 "category": {
                     "type": "string",
-                    "description": "Optional subfolder under documents/ (e.g. 'reports').",
+                    "description": "Optional subfolder of the documents output folder (e.g. 'reports').",
                 },
             },
             "required": ["input_path", "to_format"],
@@ -122,7 +124,7 @@ TOOLS = [
                 },
                 "output_path": {
                     "type": "string",
-                    "description": "Absolute path for the output file. Defaults to the documents directory.",
+                    "description": "Output path inside the documents output folder (relative paths are taken relative to it). Paths outside that folder are refused. Defaults to a new file in the folder.",
                 },
                 "template": {
                     "type": "string",
@@ -134,33 +136,6 @@ TOOLS = [
                 },
             },
             "required": ["format", "content"],
-        },
-    },
-    {
-        "name": "doc_edit_pdf",
-        "description": "Edit a PDF page using search-and-replace via PyMuPDF. Provide a natural language instruction like 'change <search> to <replace>'.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to the PDF file.",
-                },
-                "page": {
-                    "type": "integer",
-                    "description": "Page number to edit (1-indexed).",
-                    "default": 1,
-                },
-                "instruction": {
-                    "type": "string",
-                    "description": "Natural language instruction for the edit (e.g. 'change \"foo\" to \"bar\"').",
-                },
-                "output_path": {
-                    "type": "string",
-                    "description": "Optional output path. Defaults to <original>_edited.pdf",
-                },
-            },
-            "required": ["path", "instruction"],
         },
     },
 ]
@@ -184,7 +159,7 @@ def handle_tool(name: str, args: dict) -> str:
         raise UnknownToolError(f"unknown tool: {name}")
     try:
         if name == "doc_read":
-            from tabella.read import read
+            from .read import read
             text = read(
                 args["path"],
                 max_chars=args.get("max_chars", 1_000_000),
@@ -199,12 +174,12 @@ def handle_tool(name: str, args: dict) -> str:
             })
 
         elif name == "doc_read_meta":
-            from tabella.read import read_meta
+            from .read import read_meta
             meta = read_meta(args["path"])
             return json.dumps({"success": True, "path": args["path"], "metadata": meta})
 
         elif name == "doc_convert":
-            from tabella.convert import doc_convert
+            from .convert import doc_convert
             result = doc_convert(
                 input_path=args["input_path"],
                 to_format=args["to_format"],
@@ -216,14 +191,8 @@ def handle_tool(name: str, args: dict) -> str:
             return json.dumps(result)
 
         elif name == "doc_create_document":
-            from tabella.create import create_document
-            output_path = args.get("output_path")
-            if not output_path:
-                from tabella import get_output_dir
-                import time
-                ts = int(time.time())
-                fmt = args["format"]
-                output_path = str(get_output_dir() / f"doc_{ts}.{fmt}")
+            from .create import create_document, default_output_path
+            output_path = args.get("output_path") or default_output_path(args["format"])
             result = create_document(
                 format=args["format"],
                 content=args["content"],
@@ -233,15 +202,6 @@ def handle_tool(name: str, args: dict) -> str:
             )
             return json.dumps(result)
 
-        elif name == "doc_edit_pdf":
-            from tabella.create import _edit_pdf_text
-            result = _edit_pdf_text(
-                path=args["path"],
-                page=args.get("page", 1),
-                instruction=args["instruction"],
-                output_path=args.get("output_path"),
-            )
-            return json.dumps(result)
 
     except Exception as e:
         return json.dumps({"success": False, "error": f"{type(e).__name__}: {e}"})

@@ -1,19 +1,22 @@
 """documents.create — Create .docx, .xlsx, .pptx, .pdf, .odt, .ods, .odp documents from structured JSON.
 
-Merged from the doc_create plugin. Dependencies (python-docx, openpyxl,
-python-pptx, weasyprint, odfpy, nano-pdf) are now installed directly in the
-the bootstrapped per-plugin venv (PYTHON_BOOTSTRAP: scripts/setup.sh; stdio/HTTP servers exec into it on first serve)
-Builder functions import and use the libraries directly.
+Dependencies (python-docx, openpyxl, python-pptx, weasyprint, odfpy) must
+already be importable in the host Python; nothing is installed at runtime.
+Every document is written inside the output folder (DOCS_OUTPUT_DIR, else
+~/Documents); any other target is refused.
 """
 
 import html
-import json
 import logging
-import re
 import time
-from pathlib import Path
 
-from .utils import _get_output_dir, _is_in_output_dir, _resolve_output_dir
+from .utils import (
+    MissingDependencyError,
+    OutsideOutputDirError,
+    check_read_allowed,
+    contained_output_path,
+    require,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +200,7 @@ def _build_docx(content: dict, output_path: str, template: str = None, options: 
                             table.rows[row_idx].cells[col_idx].text = str(cell)
                     row_idx += 1
             elif stype == "image":
+                check_read_allowed(section["path"])
                 doc.add_picture(section["path"], width=Inches(section.get("width", 5)))
             elif stype == "page_break":
                 doc.add_page_break()
@@ -638,6 +642,23 @@ def _build_pdf_from_html(content: dict, output_path: str, template: str = None, 
 
 # ── core create_document ──
 
+# format -> (import name, pip package) checked before building, so a missing
+# package is a plain "not available" message rather than an ImportError.
+_FORMAT_DEPS = {
+    "docx": ("docx", "python-docx"),
+    "xlsx": ("openpyxl", "openpyxl"),
+    "pptx": ("pptx", "python-pptx"),
+    "pdf": ("weasyprint", "weasyprint"),
+    "odt": ("odf", "odfpy"),
+    "ods": ("odf", "odfpy"),
+    "odp": ("odf", "odfpy"),
+}
+
+
+def default_output_path(fmt: str) -> str:
+    """A timestamped file name inside the output folder."""
+    return str(contained_output_path(f"doc_{int(time.time())}.{fmt}"))
+
 def create_document(format: str, content, output_path: str, template: str = None, options: dict = None) -> dict:
     """Create a document in the specified format.
 
@@ -649,15 +670,10 @@ def create_document(format: str, content, output_path: str, template: str = None
         options: Optional format-specific options
     """
     format = format.lower()
-    out = Path(output_path).expanduser().resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    if not _is_in_output_dir(out):
-        logger.warning(
-            "doc_create: output file %s is outside the configured output directory. "
-            "Files saved here may not be synced.",
-            out,
-        )
+    try:
+        out = contained_output_path(output_path)
+    except OutsideOutputDirError as e:
+        return {"success": False, "error": str(e)}
 
     builders = {
         "docx": _build_docx,
@@ -672,6 +688,20 @@ def create_document(format: str, content, output_path: str, template: str = None
     if format not in builders:
         return {"success": False, "error": f"Unsupported format: {format}"}
 
+    module, package = _FORMAT_DEPS[format]
+    try:
+        require(module, package, f"{format.upper()} creation")
+    except MissingDependencyError as e:
+        return {"success": False, "error": str(e)}
+
+    if template:
+        try:
+            check_read_allowed(template)
+        except PermissionError as e:
+            return {"success": False, "error": str(e)}
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+
     # Normalize string content into structured dict
     normalized = _normalize_content(format, content, options=options)
 
@@ -684,232 +714,3 @@ def create_document(format: str, content, output_path: str, template: str = None
     if result.get("success") and "path" in result:
         result["message"] = f"MEDIA:{result['path']}\n\nDocument created ({format}): {result['path']}"
     return result
-
-
-# ── PDF editing ──
-
-def _edit_pdf_text(path: str, page: int, instruction: str, output_path: str = None) -> dict:
-    """Edit PDF text via pymupdf search-and-replace (no LLM, provider-agnostic)."""
-    try:
-        import pymupdf as fitz  # PyMuPDF >= 1.24 exposes the canonical name
-    except ImportError:
-        return {"success": False, "error": "pymupdf not installed."}
-
-    doc = fitz.open(path)
-    if page < 1 or page > len(doc):
-        return {"success": False, "error": f"Page {page} out of range (1-{len(doc)})."}
-
-    page_obj = doc[page - 1]
-    original_text = page_obj.get_text()
-
-    # Try to parse "change X to Y" / "replace X with Y" / "fix X to Y" patterns
-    patterns = [
-        r"(?:change|replace|fix|update|correct)\s+['\"]?(.+?)['\"]?\s+(?:to|with|->)\s+['\"]?(.+?)['\"]?$",
-        r"['\"]?(.+?)['\"]?\s*->\s*['\"]?(.+?)['\"]?$",
-    ]
-
-    search_text = None
-    replace_text = None
-    for pattern in patterns:
-        m = re.search(pattern, instruction.strip(), re.IGNORECASE)
-        if m:
-            search_text = m.group(1).strip().strip("'\"")
-            replace_text = m.group(2).strip().strip("'\"")
-            break
-
-    if not search_text:
-        return {
-            "success": False,
-            "error": (
-                "Could not parse instruction. Use format: "
-                "'change <search> to <replace>' or 'replace <search> with <replace>'"
-            ),
-            "page_text": original_text[:2000],
-        }
-
-    # pymupdf text replacement: find rects, redact, insert new text
-    found = False
-    text_instances = page_obj.search_for(search_text)
-
-    if not text_instances:
-        # Try case-insensitive fallback by scanning all text blocks
-        blocks = page_obj.get_text("blocks")
-        for block in blocks:
-            if search_text.lower() in block[4].lower():
-                # Found in a block, try to locate it more precisely
-                text_instances = page_obj.search_for(block[4].strip()[:len(search_text) + 20])
-                break
-
-    if not text_instances:
-        return {
-            "success": False,
-            "error": f"Text '{search_text}' not found on page {page}.",
-            "page_text": original_text[:2000],
-        }
-
-    for rect in text_instances:
-        # Redact the area and insert replacement text
-        page_obj.add_redact_annot(rect, text=replace_text, fontsize=11)
-        found = True
-
-    if found:
-        page_obj.apply_redactions()
-
-    if not output_path:
-        output_path = str(Path(path).parent / f"{Path(path).stem}_edited.pdf")
-
-    doc.save(output_path)
-    doc.close()
-
-    return {
-        "success": True,
-        "path": output_path,
-        "format": "pdf",
-        "page": page,
-        "instruction": instruction,
-        "search": search_text,
-        "replace": replace_text,
-        "message": f"PDF edited (page {page}). Output: {output_path}",
-    }
-
-
-# Kept for backward compat — calls the text-based editor
-_edit_pdf_via_nano_pdf = _edit_pdf_text
-
-
-# ── Hermes handlers ──
-
-def _handle_doc_create(params: dict, **kwargs) -> str:
-    """Handler for doc_create_document tool."""
-    # Accept either "output_path" or "path" for backward compatibility
-    output_path = params.get("output_path") or params.get("path")
-
-    # Read user_files from middleware-injected _user_context (if present).
-    # This replaces the old HERMES_PROFILE / ctx / cwd fallback chain.
-    user_context = params.get("_user_context", {})
-    user_files = user_context.get("user_files")
-
-    if not output_path:
-        # No explicit path — use user_files/Documents if available, else fallback
-        ts = int(time.time())
-        fmt = params["format"]
-        if user_files:
-            docs_dir = Path(user_files) / "Documents"
-            docs_dir.mkdir(parents=True, exist_ok=True)
-            output_path = str(docs_dir / f"doc_{ts}.{fmt}")
-        else:
-            # Fallback: profile cache (preserves existing behaviour for solo users)
-            cache_dir = _get_output_dir()
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            output_path = str(cache_dir / f"doc_{ts}.{fmt}")
-    elif user_files and "/tmp/" in output_path:
-        # Redirect /tmp paths to user_files/Documents for media delivery compatibility
-        ts = int(time.time())
-        fmt = params["format"]
-        p = Path(output_path)
-        if p.name and p.name != ".":
-            filename = p.stem + f"_{ts}.{fmt}"
-        else:
-            filename = f"doc_{ts}.{fmt}"
-        docs_dir = Path(user_files) / "Documents"
-        docs_dir.mkdir(parents=True, exist_ok=True)
-        output_path = str(docs_dir / filename)
-        logger.info("doc_create: redirected /tmp path to %s via user_files", output_path)
-
-    result = create_document(
-        format=params["format"],
-        content=params["content"],
-        output_path=output_path,
-        template=params.get("template"),
-        options=params.get("options"),
-    )
-    if isinstance(result, dict):
-        return json.dumps(result)
-    return result
-
-
-def _handle_doc_edit(params: dict, **kwargs) -> str:
-    """Handler for doc_edit_pdf tool."""
-    result = _edit_pdf_via_nano_pdf(
-        path=params["path"],
-        page=params.get("page", 1),
-        instruction=params["instruction"],
-        output_path=params.get("output_path"),
-    )
-    if isinstance(result, dict):
-        return json.dumps(result)
-    return result
-
-
-# ── plugin registration ──
-def register(registry):
-    registry.register_tool(
-        name="doc_create_document",
-        toolset="doc-create",
-        schema={
-            "type": "object",
-            "properties": {
-                "format": {
-                    "type": "string",
-                    "enum": ["docx", "xlsx", "pptx", "pdf", "odt", "ods", "odp"],
-                    "description": "Output document format.",
-                },
-                "content": {
-                    "anyOf": [
-                        {"type": "string", "description": "Plain text or HTML content (auto-detected and normalized)."},
-                        {"type": "object", "description": "Structured content dict. Format-specific schema (see references/)."},
-                    ],
-                    "description": "Document content. Accepts plain text, HTML, or structured dict.",
-                },
-                "output_path": {
-                    "type": "string",
-                    "description": "Absolute path for the output file. Also accepts 'path' as an alias.",
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Alias for output_path. Absolute path for the output file.",
-                },
-                "template": {
-                    "type": "string",
-                    "description": "Optional template path — honored by docx (.docx/.dotx) and pptx (.pptx/.potx) creation: styles, theme, headers/footers and slide layouts load from the file. Ignored by every other format.",
-                },
-                "options": {
-                    "type": "object",
-                    "description": "Optional format-specific options (title, page_size, auto_size, etc.)",
-                },
-            },
-            "required": ["format", "content"],
-        },
-        handler=_handle_doc_create,
-        description="Create .docx, .xlsx, .pptx, .pdf, .odt, .ods, or .odp documents. For PDFs: pass structured JSON for document-style output, or pass {\"html\": \"<html>...</html>\"} with full CSS (Grid, Flexbox, gradients, themes) for visual/print-ready PDFs via weasyprint. Supports page_size, header, footer, page_numbers options.",
-    )
-
-    registry.register_tool(
-        name="doc_edit_pdf",
-        toolset="doc-create",
-        schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to the PDF file.",
-                },
-                "page": {
-                    "type": "integer",
-                    "description": "Page number to edit (1-indexed).",
-                    "default": 1,
-                },
-                "instruction": {
-                    "type": "string",
-                    "description": "Natural language instruction for the edit.",
-                },
-                "output_path": {
-                    "type": "string",
-                    "description": "Optional output path. Defaults to <original>_edited.pdf",
-                },
-            },
-            "required": ["path", "instruction"],
-        },
-        handler=_handle_doc_edit,
-        description="Edit a PDF page via local PyMuPDF text search and redaction (no AI service).",
-    )

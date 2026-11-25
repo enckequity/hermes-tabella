@@ -2,20 +2,21 @@
 
 Three modules:
   - create  — Generate .docx/.xlsx/.pptx/.pdf/.odt/.ods/.odp from structured JSON
-  - convert — Format conversion via pandoc + LaTeX
-  - read    — Extract text and metadata from any document via LiteParse
+  - convert — Format conversion via pandoc (PDF output via WeasyPrint)
+  - read    — Extract text and metadata via anydoc, with LiteParse for OCR
+
+Nothing is installed or downloaded at runtime: the packages must already be
+importable in the host Python.
 """
 
 from __future__ import annotations
 
-import os
+import re
 from pathlib import Path
-
-from .bootstrap import resolve_venv_python
 
 
 def _read_version() -> str:
-    """The package version, from installed metadata or pyproject.toml.
+    """The package version, from pyproject.toml, plugin.yaml or installed metadata.
 
     One source: pyproject.toml. Installed distributions read it back from
     their metadata (so a wheel cannot disagree with itself); a checkout or a
@@ -33,6 +34,16 @@ def _read_version() -> str:
                 return line.split("=", 1)[1].strip().strip('"')
     except OSError:
         pass
+    # Plugin directory without pyproject.toml (stripped for install): the
+    # plugin.yaml manifest beside the package carries the same version.
+    manifest = Path(__file__).resolve().parent.parent / "plugin.yaml"
+    try:
+        match = re.search(r'^version:\s*"?([^"\s]+)"?\s*$',
+                          manifest.read_text(encoding="utf-8"), re.MULTILINE)
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
     # Installed from a wheel/sdist: the built metadata is authoritative.
     try:
         from importlib.metadata import version
@@ -46,19 +57,6 @@ __version__ = _read_version()
 
 # ── Configuration ─────────────────────────────────────────────
 
-def get_docs_venv_python() -> str:
-    """Path to the Python binary in the docs venv.
-
-    Resolution order:
-    1. DOCS_VENV_PYTHON env var (explicit override)
-    2. PLUGIN_DATA/venv/bin/python (v1 client-managed data directory)
-    3. ~/.venvs/docs/venv/bin/python (fallback)
-
-    Delegates to tabella.bootstrap so the path can only be wrong in one place.
-    """
-    return resolve_venv_python()
-
-
 def get_output_dir() -> Path:
     """Default output directory for generated documents.
 
@@ -70,4 +68,4 @@ def get_output_dir() -> Path:
     return _get_output_dir()
 
 
-__all__ = ["get_docs_venv_python", "get_output_dir"]
+__all__ = ["get_output_dir"]

@@ -17,6 +17,13 @@ pytest.importorskip("PIL")
 pytest.importorskip("anydoc")
 pytest.importorskip("liteparse")
 
+from tabella.read import _local_tessdata  # noqa: E402
+
+pytestmark = pytest.mark.skipif(
+    _local_tessdata() is None,
+    reason="no local eng.traineddata (OCR is disabled rather than downloaded)",
+)
+
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
 

@@ -39,9 +39,8 @@ create = [
 read = [
     "firecrawl-anydoc>=0.1.1,<0.3.0",
     "liteparse>=2.0.0,<3.0.0",
-    "PyMuPDF>=1.24,<2.0",
 ]
-convert = []  # requires system pandoc + LaTeX (texlive-xetex); no python wrapper needed
+convert = []  # requires system pandoc; PDF output uses weasyprint (create extra), no LaTeX
 all = [
     "python-docx>=1.0,<2.0",
     "openpyxl>=3.1,<4.0",
@@ -52,7 +51,6 @@ all = [
     "lxml>=5.0,<7.0",
     "firecrawl-anydoc>=0.1.1,<0.3.0",
     "liteparse>=2.0.0,<3.0.0",
-    "PyMuPDF>=1.24,<2.0",
 ]
 dev = [
     "pytest>=7.0",
